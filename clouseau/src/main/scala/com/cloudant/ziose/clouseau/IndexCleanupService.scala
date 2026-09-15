@@ -18,7 +18,8 @@ import java.text.SimpleDateFormat
 import java.util.Calendar
 import java.util.TimeZone
 import _root_.com.cloudant.ziose.scalang
-
+import org.apache.lucene.index.IndexWriter
+import org.apache.lucene.store.{Directory, FSDirectory}
 import scalang._
 
 class IndexCleanupService(ctx: ServiceContext[ConfigurationArgs])(implicit adapter: Adapter[_, _]) extends Service(ctx) with Instrumented {
@@ -34,7 +35,11 @@ class IndexCleanupService(ctx: ServiceContext[ConfigurationArgs])(implicit adapt
     case CleanupPathMsg(path: String) =>
       val dir = new File(rootDir, path)
       logger.info("Removing %s".format(path))
-      recursivelyDelete(dir, true)
+      val lock = FSDirectory.open(dir).makeLock("write.lock")
+      if (lock.obtain()) {
+        recursivelyDelete(dir, true)
+        lock.close()
+      }
     case RenamePathMsg(dbName: String) =>
       val srcDir = new File(rootDir, dbName)
       val sdf = new SimpleDateFormat("yyyyMMdd'.'HHmmss")
@@ -62,7 +67,8 @@ class IndexCleanupService(ctx: ServiceContext[ConfigurationArgs])(implicit adapt
       cleanup(file, includePattern, activeSigs)
     }
     val m = includePattern.matcher(fileOrDir.getAbsolutePath)
-    if (m.find && !activeSigs.contains(m.group(1))) {
+    val lock = FSDirectory.open(fileOrDir).makeLock("write.lock")
+    if (m.find && !activeSigs.contains(m.group(1)) && lock.obtain()) {
       logger.info("Removing unreachable index " + m.group)
       call('main, ('delete, m.group)) match {
         case 'ok =>
@@ -71,6 +77,7 @@ class IndexCleanupService(ctx: ServiceContext[ConfigurationArgs])(implicit adapt
           recursivelyDelete(fileOrDir, false)
           fileOrDir.delete
       }
+      lock.close()
     }
   }
 

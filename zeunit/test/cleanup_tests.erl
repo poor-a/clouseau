@@ -1,9 +1,9 @@
 % To run only this suite use
 % ```
-% make zeunit suites=clouseau_tests
+% make zeunit suites=cleanup_tests
 % ```
 
--module(clouseau_tests).
+-module(cleanup_tests).
 -feature(maybe_expr, enable).
 
 -include("zeunit.hrl").
@@ -59,16 +59,76 @@
 clouseau_test_() ->
     {"clouseau cleanup service tests",
         {foreachx, fun setup/1, fun teardown/2, [
-            ?TDEF_FEXN(ioq, t_cleanup_1),
-            ?TDEF_FEXN(ioq, t_cleanup_2),
-            ?TDEF_FEXN(ioq, t_rename),
+          ?TDEF_FEXN_TIMEOUT(ioq, cleanup_vs_read)
+            %?TDEF_FEXN(ioq, t_cleanup_db)
+            %?TDEF_FEXN(ioq, t_cleanup_closed_index),
+            %?TDEF_FEXN(ioq, t_dont_cleanup_open_index),
+            %?TDEF_FEXN(ioq, t_rename),
 
-            ?TDEF_FEXN(gen_server, t_cleanup_1),
-            ?TDEF_FEXN(gen_server, t_cleanup_2),
-            ?TDEF_FEXN(gen_server, t_rename)
+            %?TDEF_FEXN(gen_server, t_cleanup_db),
+            %?TDEF_FEXN(gen_server, t_cleanup_closed_index),
+            %?TDEF_FEXN(ioq, t_dont_cleanup_open_index),
+            %?TDEF_FEXN(gen_server, t_rename)
         ]}}.
 
-t_cleanup_1(
+noop(_Kind, _Ctx) ->
+  ok.
+
+cleanup_one_index(_Kind, Ctx) ->
+  cleanup_index(1, Ctx),
+  timer:sleep(15 * 000),
+  io:format("Sending second cleanup"),
+  cleanup_index(1, Ctx),
+  timer:sleep(15 * 000),
+  ok.
+
+%% ok
+%% total search requests: 9990
+%% index service stops around 1550 requests, exit is clean
+%% see clouseau-logs/cleanup_vs_read_stress_test_09_23.log
+cleanup_vs_read(_Kind, Ctx) ->
+  Index = get_index(1, Ctx),
+  Seq = lists:duplicate(250, search) ++ [cleanup] ++ lists:duplicate(749, search),
+  Runners = 10,
+  DoWork = fun () -> lists:foreach(fun (Action) -> case Action of
+          search -> spawn(fun() -> clouseau_rpc:search(Index#index.pid, []) end);
+          cleanup -> spawn(fun() -> async_cleanup_index(1, Ctx) end)
+        end,
+        timer:sleep(1)
+      end, Seq) end,
+  RunningReqIds = lists:foldl(
+    fun (N, ReqIds) -> erpc:send_request(node(), DoWork, N, ReqIds) end,
+    erpc:reqids_new(),
+    lists:seq(1, Runners)),
+  lists:foldl(
+    fun (_, ReqIds) -> {{response, _}, _, NewReqIds} = erpc:wait_response(ReqIds, 2000, true), NewReqIds end,
+    RunningReqIds,
+    lists:seq(1, erpc:reqids_size(RunningReqIds))),
+  ok.
+
+cleanup_vs_write(_Kind, Ctx) ->
+  Index = get_index(1, Ctx),
+  Seq = lists:duplicate(250, write) ++ [cleanup] ++ lists:duplicate(749, write),
+  Runners = 10,
+  StartCommit = 16,
+  DoWork = fun () -> lists:foreach(fun (Action) -> case Action of
+          write -> spawn(fun() -> write_index(1, 10, ?FIELDS, Ctx) end);
+          cleanup -> spawn(fun() -> async_cleanup_index(1, Ctx) end)
+        end,
+        timer:sleep(1)
+      end, Seq) end,
+  spawn(fun () -> lists:foreach(fun (Commit) -> clouseau_rpc:commit(Index#index.pid, Commit), timer:sleep(100) end, lists:seq(StartCommit, StartCommit + 10000)) end),
+  RunningReqIds = lists:foldl(
+    fun (N, ReqIds) -> erpc:send_request(node(), DoWork, N, ReqIds) end,
+    erpc:reqids_new(),
+    lists:seq(1, Runners)),
+  lists:foldl(
+    fun (_, ReqIds) -> {{response, _}, _, NewReqIds} = erpc:wait_response(ReqIds, 2000, true), NewReqIds end,
+    RunningReqIds,
+    lists:seq(1, erpc:reqids_size(RunningReqIds))),
+  ok.
+
+t_cleanup_db(
     _Kind, #context{echo_pid = EchoService, dbname = DBName, shard_name = ShardsDbName} = Ctx
 ) ->
     ResultBeforeCleanup = get_files_grouped_by_index(Ctx),
@@ -90,7 +150,7 @@ t_cleanup_1(
     ),
     ok.
 
-t_cleanup_2(_Kind, #context{} = Ctx) ->
+t_cleanup_closed_index(_Kind, #context{} = Ctx) ->
     ResultBeforeCleanup = get_files_grouped_by_index(Ctx),
     ?assertMatch(
         {ok, _},
@@ -126,6 +186,9 @@ t_cleanup_2(_Kind, #context{} = Ctx) ->
     ),
     ?assertMatch(["_0.fdt", "_0.fdx" | _LockFile], lists:sort(FilesBeforeCleanupForIndex2)),
 
+    ResultClose = close_index(1, Ctx),
+    ?assertMatch(ok, ResultClose, "Expected index to close in time"),
+
     ResultCleanup = cleanup_index(1, Ctx),
     ?assertMatch(
         {ok, {_, #{Signature2 := _}}},
@@ -159,11 +222,87 @@ t_cleanup_2(_Kind, #context{} = Ctx) ->
         ])
     ),
 
-    FilesAfterCleanupForIndex2 = maps:get(Signature2, ListOfFilesBeforeCleanup, no_files),
+    FilesAfterCleanupForIndex2 = maps:get(Signature2, ListOfFilesAfterCleanup, no_files),
     ?assert(
         is_list(FilesAfterCleanupForIndex2),
+        ?format("Expected to find files for second index (~p) among: ~p", [
+            Signature2, FilesAfterCleanupForIndex2
+        ])
+    ),
+    ?assertMatch(["_0.fdt", "_0.fdx" | _LockFile], lists:sort(FilesAfterCleanupForIndex2)),
+    ok.
+
+t_dont_cleanup_open_index(_Kind, #context{dbname = DbName} = Ctx) ->
+    ResultBeforeCleanup = get_files_grouped_by_index(Ctx),
+    ?assertMatch(
+        {ok, _},
+        ResultBeforeCleanup,
+        ?format("Expected to be able to get indexes for database, got: ~p", [ResultBeforeCleanup])
+    ),
+    {ok, {_BeforeDir, ListOfFilesBeforeCleanup}} = ResultBeforeCleanup,
+    ?assertEqual(
+        2,
+        maps:size(ListOfFilesBeforeCleanup),
+        ?format("Expected to find two folders, got ~p, here they are ~p", [
+            maps:size(ListOfFilesBeforeCleanup), ListOfFilesBeforeCleanup
+        ])
+    ),
+
+    #index{signature = Signature1} = get_index(1, Ctx),
+    FilesBeforeCleanupForIndex1 = maps:get(Signature1, ListOfFilesBeforeCleanup, no_files),
+    ?assert(
+        is_list(FilesBeforeCleanupForIndex1),
         ?format("Expected to find files for first index (~p) among: ~p", [
-            Signature1, FilesAfterCleanupForIndex2
+            Signature1, FilesBeforeCleanupForIndex1
+        ])
+    ),
+    ?assertMatch(["_0.fdt", "_0.fdx" | _LockFile], lists:sort(FilesBeforeCleanupForIndex1)),
+
+    #index{signature = Signature2} = get_index(2, Ctx),
+    FilesBeforeCleanupForIndex2 = maps:get(Signature2, ListOfFilesBeforeCleanup, no_files),
+    ?assert(
+        is_list(FilesBeforeCleanupForIndex2),
+        ?format("Expected to find files for first index (~p) among: ~p", [
+            Signature1, FilesBeforeCleanupForIndex2
+        ])
+    ),
+    ?assertMatch(["_0.fdt", "_0.fdx" | _LockFile], lists:sort(FilesBeforeCleanupForIndex2)),
+
+    ResultCleanup = clouseau_rpc:cleanup(DbName, []),
+    ?assertMatch(
+      ok,
+      ResultCleanup,
+      "Cleanup was successful"),
+
+    ResultAfterCleanup = get_files_grouped_by_index(Ctx),
+    ?assertMatch(
+        {ok, _},
+        ResultAfterCleanup,
+        ?format("Expected to be able to get indexes for database, got: ~p", [ResultAfterCleanup])
+    ),
+    {ok, {_AfterDir, ListOfFilesAfterCleanup}} = ResultAfterCleanup,
+    ?assertEqual(
+        2,
+        maps:size(ListOfFilesAfterCleanup),
+        ?format("Expected to find 2 folders, got ~p, here they are ~p", [
+            maps:size(ListOfFilesBeforeCleanup), ListOfFilesBeforeCleanup
+        ])
+    ),
+
+    FilesAfterCleanupForIndex1 = maps:get(Signature1, ListOfFilesAfterCleanup, no_files),
+    ?assert(
+        is_list(FilesAfterCleanupForIndex1),
+        ?format("Expected to find files for first index (~p) among: ~p", [
+            Signature1, FilesAfterCleanupForIndex1
+        ])
+    ),
+    ?assertMatch(["_0.fdt", "_0.fdx" | _LockFile], lists:sort(FilesAfterCleanupForIndex1)),
+
+    FilesAfterCleanupForIndex2 = maps:get(Signature2, ListOfFilesAfterCleanup, no_files),
+    ?assert(
+        is_list(FilesAfterCleanupForIndex2),
+        ?format("Expected to find files for second index (~p) among: ~p", [
+            Signature2, FilesAfterCleanupForIndex2
         ])
     ),
     ?assertMatch(["_0.fdt", "_0.fdx" | _LockFile], lists:sort(FilesAfterCleanupForIndex2)),
@@ -234,16 +373,16 @@ setupDb(Kind) ->
 setup({Kind, Name}) ->
     Ctx0 = setupDb(Kind),
     Ctx1 = open_indexes(Ctx0),
-    ok = update_index(1, 1, ?FIELDS, Ctx1),
-    ok = update_index(2, 2, ?FIELDS, Ctx1),
+    lists:foreach(fun (N) -> update_index(1, N, N, ?FIELDS, Ctx1), timer:sleep(1000) end, lists:seq(1, 15)),
+    % ok = update_index(2, 2, ?FIELDS, Ctx1),
     EchoPid = start_service(Name),
     Ctx1#context{echo_pid = EchoPid}.
 
 open_indexes(#context{shard_name = ShardsDbName} = Ctx) ->
     Ctx#context{
         indexes = #{
-            1 => open_index(1, ShardsDbName),
-            2 => open_index(2, ShardsDbName)
+            1 => open_index(1, ShardsDbName)
+            % 2 => open_index(2, ShardsDbName)
         }
     }.
 
@@ -267,21 +406,38 @@ open_index(Idx, ShardsDbName) ->
             #index{idx = Idx, path = Path, signature = binary_to_list(Sig), pid = IndexPid}
     end.
 
-update_index(Idx, UpdateSeq, Fields, #context{indexes = Indexes}) ->
+close_index(Idx, #context{indexes = Indexes}) ->
+  #{Idx := #index{pid = IndexPid}} = Indexes,
+  clouseau_rpc:close_index(IndexPid).
+
+write_index(Idx, DocId, Fields, #context{indexes = Indexes}) ->
     #{Idx := #index{pid = IndexPid}} = Indexes,
-    IdxBin = integer_to_binary(Idx),
-    DocId = <<"doc", IdxBin/binary>>,
-    ok = clouseau_rpc:update(IndexPid, DocId, Fields),
+    DocIdBin = integer_to_binary(DocId),
+    FullDocId = <<"doc", DocIdBin/binary>>,
+    ok = clouseau_rpc:update(IndexPid, FullDocId, Fields),
+    ok.
+
+update_index(Idx, UpdateSeq, DocId, Fields, #context{indexes = Indexes}) ->
+    #{Idx := #index{pid = IndexPid}} = Indexes,
+    DocIdBin = integer_to_binary(DocId),
+    FullDocId = <<"doc", DocIdBin/binary>>,
+    ok = clouseau_rpc:update(IndexPid, FullDocId, Fields),
     ok = clouseau_rpc:commit(IndexPid, UpdateSeq),
     ok.
 
+async_cleanup_index(Idx, #context{dbname = DbName, indexes = Indexes} = Ctx) ->
+    CleanupSig = (get_index(Idx, Ctx))#index.signature,
+    ActiveSigs = [list_to_binary(I#index.signature) || {K, I} <- maps:to_list(Indexes), K =/= Idx],
+    ?assertEqual(ok, clouseau_rpc:cleanup(DbName, ActiveSigs)).
+
 cleanup_index(Idx, #context{dbname = DbName, indexes = Indexes} = Ctx) ->
+    CleanupSig = (get_index(Idx, Ctx))#index.signature,
     ActiveSigs = [list_to_binary(I#index.signature) || {K, I} <- maps:to_list(Indexes), K =/= Idx],
     ?assertEqual(ok, clouseau_rpc:cleanup(DbName, ActiveSigs)),
     util:wait(
         fun() ->
             case get_files_grouped_by_index(Ctx) of
-                {ok, {_, Map}} when map_size(Map) > 1 ->
+                {ok, {_, Map}} when is_map_key(CleanupSig, Map) ->
                     wait;
                 {ok, Result} ->
                     {ok, Result}
@@ -327,7 +483,8 @@ teardown(Ctx, #context{echo_pid = EchoPid, indexes = Indexes}) ->
     maps:map(
         fun(_, #index{pid = IndexPid}) ->
             unlink(IndexPid),
-            stop_service(Ctx, IndexPid)
+            stop_service(Ctx, IndexPid),
+            timer:sleep(15 * 1000)
         end,
         Indexes
     ),

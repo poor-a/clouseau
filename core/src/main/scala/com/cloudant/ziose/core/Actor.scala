@@ -2,6 +2,7 @@ package com.cloudant.ziose.core
 
 import com.cloudant.ziose.macros.CheckEnv
 import zio.{Cause, Duration, Trace, UIO, ZIO}
+
 import java.util.concurrent.atomic.AtomicBoolean
 import zio.Promise
 import zio.logging.LogAnnotation
@@ -88,7 +89,9 @@ class AddressableActor[A <: Actor, C <: ProcessContext](actor: A, context: C)
   }
 
   def onTermination(result: ActorResult): UIO[ActorResult] = {
+    println(s"[$name] AddressableActor.onTermination: setting isFinalized")
     if (!isFinalized.getAndSet(true)) {
+      println(s"[$name] AddressableActor.onTermination: doing finalization")
       val reason = resultToReason(result)
       def onFunc = actor.onTermination(reason, ctx).as(ActorResult.Stop())
       for {
@@ -198,6 +201,7 @@ class AddressableActor[A <: Actor, C <: ProcessContext](actor: A, context: C)
   }
 
   def handleActorResult(result: ActorResult): UIO[Boolean] = {
+    println(s"[$name] AddressableActor.handleActorResult: got result $result")
     result match {
       case ActorResult.Continue() =>
         ZIO.succeed(result.shouldContinue)

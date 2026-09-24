@@ -103,7 +103,7 @@ class IndexService(ctx: ServiceContext[IndexServiceArgs])(implicit adapter: Adap
   val parSearchTimeOutCount = metrics.counter("partition_search.timeout.count")
 
   // Start committer heartbeat
-  val commitInterval = ctx.args.config.getInt("commit_interval_secs", 30)
+  val commitInterval = ctx.args.config.getInt("commit_interval_secs", 1)
   val timeAllowed = ctx.args.config.getLong("clouseau.search_allowed_timeout_msecs", 5000)
   val countFieldsEnabled = ctx.args.config.getBoolean("clouseau.count_fields", false)
 
@@ -120,6 +120,7 @@ class IndexService(ctx: ServiceContext[IndexServiceArgs])(implicit adapter: Adap
 
   override def handleInit(): Unit = {
     logger.debug(s"handleInit(capacity = ${adapter.capacity})")
+    logger.debug(prefix_name(s"Opened Index service with commit interval ${commitInterval}"))
     setReader(DirectoryReader.open(ctx.args.writer, true))
     sendEvery(self.pid, 'maybe_commit, commitInterval * 1000)
     send(self.pid, 'count_fields)
@@ -144,6 +145,7 @@ class IndexService(ctx: ServiceContext[IndexServiceArgs])(implicit adapter: Adap
       lastLRUUpdate = now
       send('main, ('touch_lru, ctx.args.name))
     }
+    logger.debug(prefix_name(s"Handling call message $msg"))
     internalHandleCall(tag, msg)
   }
 
@@ -240,6 +242,7 @@ class IndexService(ctx: ServiceContext[IndexServiceArgs])(implicit adapter: Adap
     case 'count_fields =>
       countFields
     case 'delete =>
+      logger.debug(prefix_name("Executing delete in handleInfo"))
       val dir = ctx.args.writer.getDirectory
       ctx.args.writer.close()
       for (name <- dir.listAll) {
@@ -295,9 +298,12 @@ class IndexService(ctx: ServiceContext[IndexServiceArgs])(implicit adapter: Adap
       case e: IOException => logger.warn(prefix_name("Error while closing reader"), e)
     }
     try {
+      logger.debug(prefix_name("Rolling back uncommitted stuff"))
       ctx.args.writer.rollback()
     } catch {
-      case e: AlreadyClosedException => 'ignored
+      case e: AlreadyClosedException =>
+        logger.debug(prefix_name("Writer already closed, ignoring"))
+        'ignored
       case e: IOException =>
         logger.warn(prefix_name("Error while closing writer"), e)
         val dir = ctx.args.writer.getDirectory
@@ -305,8 +311,10 @@ class IndexService(ctx: ServiceContext[IndexServiceArgs])(implicit adapter: Adap
           IndexWriter.unlock(dir);
         }
     } finally {
+      logger.debug(prefix_name("Calling exit() in superclass"))
       super.exit(msg)
     }
+    logger.debug(prefix_name("All done, exiting.."))
     ()
   }
 
@@ -937,6 +945,7 @@ object IndexService {
           val queryParser = new ClouseauQueryParser(version, "default", analyzer)
           val writerConfig = new IndexWriterConfig(version, analyzer)
           writerConfig.setIndexDeletionPolicy(new ExternalSnapshotDeletionPolicy(dir))
+          logger.debug(s"Opening writer in mode ${writerConfig.getOpenMode}")
           val writer = new IndexWriter(dir, writerConfig)
           IndexServiceBuilder.start(node, IndexServiceArgs(config, path, queryParser, writer))
         case None =>

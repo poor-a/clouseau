@@ -24,6 +24,11 @@ end).
     {Name, fun(Name, Args) -> {atom_to_list(Name), ?_test(Name(Name, Args))} end}
 ).
 
+% DON'T COMMIT
+-define(TDEF_FEXREX(Name),
+    {Name, fun(Name, Args) -> {atom_to_list(Name), {timeout, 60, ?_test(Name(Name, Args))}} end}
+).
+
 -define(TDEF_FEX(With, Name),
     {With, fun(With, Args) -> {?format("~s - ~p", [Name, With]), ?_test(Name(With, Args))} end}
 ).
@@ -31,6 +36,12 @@ end).
 -define(TDEF_FEXN(With, Name),
     {{With, Name}, fun({With, _}, Args) ->
         {?format("~s - ~p", [Name, With]), ?_test(Name(With, Args))}
+    end}
+).
+
+-define(TDEF_FEXN_TIMEOUT(With, Name),
+    {{With, Name}, fun({With, _}, Args) ->
+        {?format("~s - ~p", [Name, With]), {timeout, 60, ?_test(Name(With, Args))}}
     end}
 ).
 

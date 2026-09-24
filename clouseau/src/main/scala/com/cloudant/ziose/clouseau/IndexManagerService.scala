@@ -195,6 +195,7 @@ class IndexManagerService(ctx: ServiceContext[ConfigurationArgs])(implicit adapt
     case ('get_root_dir) =>
       ('ok, rootDir.getAbsolutePath())
     case DeleteDocMsg(path: String) =>
+      logger.debug("Sending delete signal to service")
       lru.get(path) match {
         case null =>
           ('error, 'not_found)
@@ -238,6 +239,7 @@ class IndexManagerService(ctx: ServiceContext[ConfigurationArgs])(implicit adapt
 
   override def trapMonitorExit(monitored: Any, ref: Reference, reason: Any) = monitored match {
     case pid: Pid =>
+      logger.debug(s"Removing index ${pid} from LRU cache")
       lru.remove(pid)
     case _ =>
       'ignored

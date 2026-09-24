@@ -292,6 +292,7 @@ object OTPNode {
         builder: ActorBuilder.Sealed[A]
       ): ZIO[Scope & Node & EngineWorker, _ <: Node.Error, AddressableActor[A, _ <: ProcessContext]] = {
         val meterRegistry = Metrics.simpleRegistry
+        println(s"Spawning process with name: ${builder.name}")
         for {
           mbox       <- createMbox(builder.name)
           worker     <- ZIO.service[EngineWorker]

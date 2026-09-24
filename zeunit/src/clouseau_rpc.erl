@@ -1,5 +1,5 @@
 -module(clouseau_rpc).
--export([open_index/3]).
+-export([open_index/3, close_index/1]).
 -export([await/2, commit/2, get_update_seq/1, info/1, search/2]).
 -export([group1/7, group2/2]).
 -export([delete/2, update/3, cleanup/1, cleanup/2, rename/1]).
@@ -10,6 +10,9 @@
 
 open_index(Peer, Path, Analyzer) ->
     rpc({main, clouseau()}, {open, Peer, Path, Analyzer}).
+
+close_index(Ref) ->
+    util:stop_service(Ref).
 
 disk_size(Path) ->
     rpc({main, clouseau()}, {disk_size, Path}).

@@ -66,8 +66,10 @@ class IndexCleanupService(ctx: ServiceContext[ConfigurationArgs])(implicit adapt
       logger.info("Removing unreachable index " + m.group)
       call('main, ('delete, m.group)) match {
         case 'ok =>
+          logger.info("Signal sent but keeping index stuff in place")
           'ok
         case ('error, 'not_found) =>
+          logger.info("Signal sent, now doing the delete")
           recursivelyDelete(fileOrDir, false)
           fileOrDir.delete
       }

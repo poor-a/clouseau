@@ -24,8 +24,8 @@ rex_service_test_() ->
                 [
                     ?TDEF_FEX(t_gen_server_top),
                     ?TDEF_FEX(t_gen_server_top_meter),
-                    ?TDEF_FEX(t_erl_call_top),
-                    ?TDEF_FEX(t_erl_call_top_meter)
+                    ?TDEF_FEXREX(t_erl_call_top),
+                    ?TDEF_FEXREX(t_erl_call_top_meter)
                 ]
             }
         }

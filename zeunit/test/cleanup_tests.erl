@@ -28,6 +28,36 @@
     echo_pid :: pid()
 }).
 
+
+test_doc(Age) -> [
+  {<<"$fieldnames">>, <<"$default">>, []},
+  {<<"$fieldnames">>, <<"age_3anumber">>, []},
+  {<<"$fieldnames">>, <<"favorites._5b_5d_3alength">>, []},
+  {<<"$fieldnames">>, <<"favorites._5b_5d_3astring">>, []},
+  {<<"$fieldnames">>, <<"location.address.street_3astring">>, []},
+  {<<"$fieldnames">>, <<"location.state_3astring">>, []},
+  {<<"$default">>, <<"North Dakota">>, []},
+  {<<"$default">>, <<"Brightwater Avenue">>, []},
+  {<<"$default">>, <<"Erlang">>, []},
+  {<<"$default">>, <<"Python">>, []},
+  {<<"$default">>, <<"Lisp">>, []},
+  %% favorites.[]:string
+  {<<"favorites._5b_5d_3astring">>, <<"Lisp">>, []},
+  %% favorites.[]:string
+  {<<"favorites._5b_5d_3astring">>, <<"Python">>, []},
+  %% favorites.[]:string
+  {<<"favorites._5b_5d_3astring">>, <<"Erlang">>, []},
+  %% favorites.[]:length
+  {<<"favorites._5b_5d_3alength">>, 3, []},
+  %% location.address.street:string
+  {<<"location.address.street_3astring">>, <<"Brightwater Avenue">>, []},
+  %% location.state:string
+  {<<"location.state_3astring">>, <<"North Dakota">>, []},
+  %% age:number
+  {<<"age_3anumber">>, Age, []}
+  ].
+
+
 -define(FIELDS, [
     {<<"$fieldnames">>, <<"$default">>, []},
     {<<"$fieldnames">>, <<"age_3anumber">>, []},
@@ -59,7 +89,10 @@
 clouseau_test_() ->
     {"clouseau cleanup service tests",
         {foreachx, fun setup/1, fun teardown/2, [
-          ?TDEF_FEXN_TIMEOUT(ioq, cleanup_vs_read)
+          %?TDEF_FEXN_TIMEOUT(ioq, cleanup_vs_write)
+          %?TDEF_FEXN_TIMEOUT(ioq, write_without_commit)
+          ?TDEF_FEXN_TIMEOUT(ioq, write_forcecleanup_search)
+
             %?TDEF_FEXN(ioq, t_cleanup_db)
             %?TDEF_FEXN(ioq, t_cleanup_closed_index),
             %?TDEF_FEXN(ioq, t_dont_cleanup_open_index),
@@ -108,22 +141,114 @@ cleanup_vs_read(_Kind, Ctx) ->
 
 cleanup_vs_write(_Kind, Ctx) ->
   Index = get_index(1, Ctx),
-  Seq = lists:duplicate(250, write) ++ [cleanup] ++ lists:duplicate(749, write),
-  Runners = 10,
+  Seq = lists:duplicate(750, write) ++ [cleanup] ++ lists:duplicate(249, write),
+  Runners = 1,
   StartCommit = 16,
-  DoWork = fun () -> lists:foreach(fun (Action) -> case Action of
-          write -> spawn(fun() -> write_index(1, 10, ?FIELDS, Ctx) end);
-          cleanup -> spawn(fun() -> async_cleanup_index(1, Ctx) end)
+  DoWork = fun () -> lists:foreach(fun ({CommitIndex, Action}) -> case Action of
+          write -> spawn(fun() -> write_index(1, 10, ?FIELDS, Ctx), clouseau_rpc:commit(Index#index.pid, CommitIndex) end);
+          cleanup -> spawn(fun() -> clouseau_rpc:commit(Index#index.pid, CommitIndex), async_cleanup_index(1, Ctx) end)
         end,
         timer:sleep(1)
-      end, Seq) end,
-  spawn(fun () -> lists:foreach(fun (Commit) -> clouseau_rpc:commit(Index#index.pid, Commit), timer:sleep(100) end, lists:seq(StartCommit, StartCommit + 10000)) end),
+      end, lists:enumerate(StartCommit, Seq)) end,
   RunningReqIds = lists:foldl(
     fun (N, ReqIds) -> erpc:send_request(node(), DoWork, N, ReqIds) end,
     erpc:reqids_new(),
     lists:seq(1, Runners)),
   lists:foldl(
-    fun (_, ReqIds) -> {{response, _}, _, NewReqIds} = erpc:wait_response(ReqIds, 2000, true), NewReqIds end,
+    fun (_, ReqIds) -> {{response, _}, _, NewReqIds} = erpc:wait_response(ReqIds, 20000, true), NewReqIds end,
+    RunningReqIds,
+    lists:seq(1, erpc:reqids_size(RunningReqIds))),
+  ok.
+
+%% ok
+%% nothing extraordinary. Creates files _0 for committed stuff, _1 for buffered ? stuff, which is removed at shutdown
+% -rw-r--r--@ 1 arturpoor  staff   268 Sep 25 17:06 _1.cfe
+% -rw-r--r--@ 1 arturpoor  staff  4265 Sep 25 17:06 _1.cfs
+% -rw-r--r--@ 1 arturpoor  staff   227 Sep 25 17:06 _1.si
+% -rw-r--r--@ 1 arturpoor  staff     0 Sep 25 17:06 _2.fdt
+% -rw-r--r--@ 1 arturpoor  staff     0 Sep 25 17:06 _2.fdx
+% -rw-r--r--@ 1 arturpoor  staff   107 Sep 25 17:06 segments_2
+% -rw-r--r--@ 1 arturpoor  staff    20 Sep 25 17:06 segments.gen
+% ->
+% -rw-r--r--@ 1 arturpoor  staff   268 Sep 25 17:06 _1.cfe
+% -rw-r--r--@ 1 arturpoor  staff  4265 Sep 25 17:06 _1.cfs
+% -rw-r--r--@ 1 arturpoor  staff   227 Sep 25 17:06 _1.si
+% -rw-r--r--@ 1 arturpoor  staff   107 Sep 25 17:06 segments_2
+% -rw-r--r--@ 1 arturpoor  staff    20 Sep 25 17:06 segments.gen
+write_without_commit(_Kind, Ctx) ->
+  Index = get_index(1, Ctx),
+  Seq = lists:duplicate(20, write),
+  Runners = 1,
+  StartDocIndex = 16,
+  RandSeed = rand:seed_s(exsss, 4711),
+  DoWork = fun () -> lists:foldl(fun ({DocIndex, _}, RandState) ->
+        {RandomInt, NewRandState} = rand:uniform_s(1_000_000, RandState),
+        spawn(fun() -> write_index(1, DocIndex, test_doc(RandomInt), Ctx) end),
+        timer:sleep(2000),
+        NewRandState
+      end,
+      RandSeed,
+      lists:enumerate(StartDocIndex, Seq)) end,
+  RunningReqIds = lists:foldl(
+    fun (N, ReqIds) -> erpc:send_request(node(), DoWork, N, ReqIds) end,
+    erpc:reqids_new(),
+    lists:seq(1, Runners)),
+  lists:foldl(
+    fun (_, ReqIds) -> {{response, _}, _, NewReqIds} = erpc:wait_response(ReqIds, 60000, true), NewReqIds end,
+    RunningReqIds,
+    lists:seq(1, erpc:reqids_size(RunningReqIds))),
+  ok.
+
+
+% ok
+% Search doesn't access filesystem, probably because contents is in memory.
+% Meaningless difference between file:delete(IndexPath/*) and file:del_dir_r(IndexPath):
+% - file:delete(IndexPath/*): closing index throws exception but doesn't write to disk, folder isn't re-created
+%     see clouseau-logs/write_forcecleanup_search_test_files_delete_09_28.log
+% - file:del_dir_r(IndexPath): closing index is clean, exception isn't thrown,
+%     see clouseau-logs/write_forcecleanup_search_test_full_delete_09_25.log
+% See clouseau-logs/write_forcecleanup_search_test_09_25.log
+write_forcecleanup_search(_Kind, Ctx) ->
+  Index = get_index(1, Ctx),
+  Path = <<"../target/indexes/", (Index#index.path)/binary>>,
+  Seq = lists:duplicate(20, write) ++ [wait, force_cleanup] ++ lists:duplicate(20, search),
+  Runners = 1,
+  StartDocIndex = 16,
+  RandSeed = rand:seed_s(exsss, 4711),
+  DoWork = fun () -> lists:foldl(fun ({ActionIndex, Action}, RandState) ->
+        NextRandState = case Action of
+          write ->
+            {RandomInt, NewRandState} = rand:uniform_s(1_000_000, RandState),
+            spawn(fun() -> write_index(1, ActionIndex, test_doc(RandomInt), Ctx), clouseau_rpc:commit(Index#index.pid, ActionIndex) end),
+            timer:sleep(2000),
+            NewRandState;
+          wait ->
+            io:format("Waiting for commit~n"),
+            timer:sleep(5000),
+            RandState;
+          force_cleanup ->
+            io:format("Cleaning up index folder ~s~n", [filename:absname(Path)]),
+            lists:foreach(fun (F) -> ok = file:delete(list_to_binary([Path, "/", F])) end, element(2, file:list_dir(Path))),
+            RandState;
+          search -> spawn(fun() -> clouseau_rpc:search(Index#index.pid, []) end), RandState
+        end,
+        case file:list_dir(Path) of
+          {ok, Files} ->
+            io:format("Contents of index folder: ~p~n", [Files]);
+          _ ->
+            io:format("Index folder not found~n")
+        end,
+        NextRandState
+      end,
+      RandSeed,
+      lists:enumerate(StartDocIndex, Seq))
+    end,
+  RunningReqIds = lists:foldl(
+    fun (N, ReqIds) -> erpc:send_request(node(), DoWork, N, ReqIds) end,
+    erpc:reqids_new(),
+    lists:seq(1, Runners)),
+  lists:foldl(
+    fun (_, ReqIds) -> {{response, _}, _, NewReqIds} = erpc:wait_response(ReqIds, 60000, true), NewReqIds end,
     RunningReqIds,
     lists:seq(1, erpc:reqids_size(RunningReqIds))),
   ok.
@@ -391,7 +516,7 @@ open_index(Idx, ShardsDbName) ->
     Path = <<ShardsDbName/binary, "/", Sig/binary>>,
     Self = self(),
     ReqId = make_ref(),
-    % use auxilary process to handle EXIT messages
+    % use auxiliary process to handle EXIT messages
     spawn(fun() ->
         {ok, IndexPid} = clouseau_rpc:open_index(self(), Path, ?Analyzer),
         Self ! {ReqId, IndexPid},

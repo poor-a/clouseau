@@ -103,7 +103,7 @@ class IndexService(ctx: ServiceContext[IndexServiceArgs])(implicit adapter: Adap
   val parSearchTimeOutCount = metrics.counter("partition_search.timeout.count")
 
   // Start committer heartbeat
-  val commitInterval = ctx.args.config.getInt("commit_interval_secs", 1)
+  val commitInterval = ctx.args.config.getInt("commit_interval_secs", 5)
   val timeAllowed = ctx.args.config.getLong("clouseau.search_allowed_timeout_msecs", 5000)
   val countFieldsEnabled = ctx.args.config.getBoolean("clouseau.count_fields", false)
 
@@ -319,6 +319,7 @@ class IndexService(ctx: ServiceContext[IndexServiceArgs])(implicit adapter: Adap
   }
 
   private def commit(newUpdateSeq: Long, newPurgeSeq: Long) {
+    logger.debug(prefix_name(s"Starting to commit buffer at $updateSeq -> $newUpdateSeq"))
     if (!committing && (newUpdateSeq > updateSeq || newPurgeSeq > purgeSeq)) {
       committing = true
       val index = self
@@ -330,6 +331,7 @@ class IndexService(ctx: ServiceContext[IndexServiceArgs])(implicit adapter: Adap
           commitTimer.time {
             ctx.args.writer.commit()
           }
+          logger.debug(prefix_name(s"Commit $updateSeq -> $newUpdateSeq done, sending confirmation"))
           index ! ('committed, newUpdateSeq, newPurgeSeq)
         } catch {
           case e: AlreadyClosedException =>

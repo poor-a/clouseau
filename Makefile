@@ -401,14 +401,13 @@ await-failed:
 	@cat $(shell cli logs $(ID))
 	@exit 1
 
+# todo: print last 20 lines of log
 .PHONY: test-failed
 test-failed:
 	@echo "The thread dump before attempt to force the shutdown"
-	@cli tdump $(ID)
 	@epmd -stop $(ID) >/dev/null 2>&1 || true
 	@cli stop $(ID)
-	@echo ">>>> FAILED: The test failed. Below are the process logs:"
-	@cat $(shell cli logs $(ID))
+	@echo ">>>> FAILED: The test failed."
 	@exit 1
 
 .PHONY: couchdb-tests

@@ -90,8 +90,8 @@ clouseau_test_() ->
     {"clouseau cleanup service tests",
         {foreachx, fun setup/1, fun teardown/2, [
           %?TDEF_FEXN_TIMEOUT(ioq, cleanup_vs_write)
-          %?TDEF_FEXN_TIMEOUT(ioq, write_without_commit)
-          ?TDEF_FEXN_TIMEOUT(ioq, write_forcecleanup_search)
+          ?TDEF_FEXN_TIMEOUT(ioq, write_then_commit)
+          %?TDEF_FEXN_TIMEOUT(ioq, remove_read_end_during_writing)
 
             %?TDEF_FEXN(ioq, t_cleanup_db)
             %?TDEF_FEXN(ioq, t_cleanup_closed_index),
@@ -114,6 +114,17 @@ cleanup_one_index(_Kind, Ctx) ->
   cleanup_index(1, Ctx),
   timer:sleep(15 * 000),
   ok.
+
+list_dir_sha(Index) ->
+  Path = <<"../target/indexes/", (Index#index.path)/binary>>,
+  case file:list_dir(Path) of
+    {ok, Files} ->
+      FullPaths = lists:map(fun (File) -> binary_to_list(Path) ++ "/" ++ File end, Files),
+      Shas = os:cmd("sha256 " ++ lists:concat(lists:join(" ", FullPaths))),
+      io:format("Contents of index folder:~n~s~n", [Shas]);
+    _ ->
+      io:format("Index folder not found~n")
+  end.
 
 %% ok
 %% total search requests: 9990
@@ -199,6 +210,30 @@ write_without_commit(_Kind, Ctx) ->
     lists:seq(1, erpc:reqids_size(RunningReqIds))),
   ok.
 
+
+write_then_commit(_Kind, Ctx) ->
+  Index = get_index(1, Ctx),
+  Seq = lists:duplicate(20, write),
+  Runners = 1,
+  StartDocIndex = 16,
+  RandSeed = rand:seed_s(exsss, 4711),
+  DoWork = fun () -> lists:foldl(fun ({CommitIndex, _}, RandState) ->
+        {RandomInt, NewRandState} = rand:uniform_s(1_000_000, RandState),
+        spawn(fun() -> write_index(1, CommitIndex, test_doc(RandomInt), Ctx), clouseau_rpc:commit(Index#index.pid, CommitIndex), list_dir_sha(Index) end),
+        timer:sleep(2000),
+        NewRandState
+      end,
+      RandSeed,
+      lists:enumerate(StartDocIndex, Seq)) end,
+  RunningReqIds = lists:foldl(
+    fun (N, ReqIds) -> erpc:send_request(node(), DoWork, N, ReqIds) end,
+    erpc:reqids_new(),
+    lists:seq(1, Runners)),
+  lists:foldl(
+    fun (_, ReqIds) -> {{response, _}, _, NewReqIds} = erpc:wait_response(ReqIds, 60000, true), NewReqIds end,
+    RunningReqIds,
+    lists:seq(1, erpc:reqids_size(RunningReqIds))),
+  ok.
 
 % ok
 % Search doesn't access filesystem, probably because contents is in memory.

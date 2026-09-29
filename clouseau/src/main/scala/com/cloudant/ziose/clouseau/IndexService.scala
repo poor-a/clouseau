@@ -946,7 +946,9 @@ object IndexService {
         case Some(analyzer) =>
           val queryParser = new ClouseauQueryParser(version, "default", analyzer)
           val writerConfig = new IndexWriterConfig(version, analyzer)
-          writerConfig.setIndexDeletionPolicy(new ExternalSnapshotDeletionPolicy(dir))
+          //writerConfig.setIndexDeletionPolicy(new ExternalSnapshotDeletionPolicy(dir))
+          writerConfig.setIndexDeletionPolicy(NoDeletionPolicy.INSTANCE)
+          writerConfig.setMaxBufferedDocs(2)
           logger.debug(s"Opening writer in mode ${writerConfig.getOpenMode}")
           val writer = new IndexWriter(dir, writerConfig)
           IndexServiceBuilder.start(node, IndexServiceArgs(config, path, queryParser, writer))

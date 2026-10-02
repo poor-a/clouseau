@@ -89,8 +89,10 @@ test_doc(Age) -> [
 clouseau_test_() ->
     {"clouseau cleanup service tests",
         {foreachx, fun setup/1, fun teardown/2, [
+          %?TDEF_FEXN_TIMEOUT(ioq, noop)
           %?TDEF_FEXN_TIMEOUT(ioq, cleanup_vs_write)
-          ?TDEF_FEXN_TIMEOUT(ioq, write_then_commit)
+          %?TDEF_FEXN_TIMEOUT(ioq, read_only)
+          ?TDEF_FEXN_TIMEOUT(ioq, write_then_nuke_db_then_write_read)
           %?TDEF_FEXN_TIMEOUT(ioq, remove_read_end_during_writing)
 
             %?TDEF_FEXN(ioq, t_cleanup_db)
@@ -103,6 +105,7 @@ clouseau_test_() ->
             %?TDEF_FEXN(ioq, t_dont_cleanup_open_index),
             %?TDEF_FEXN(gen_server, t_rename)
         ]}}.
+
 
 noop(_Kind, _Ctx) ->
   ok.
@@ -195,6 +198,7 @@ write_without_commit(_Kind, Ctx) ->
   DoWork = fun () -> lists:foldl(fun ({DocIndex, _}, RandState) ->
         {RandomInt, NewRandState} = rand:uniform_s(1_000_000, RandState),
         spawn(fun() -> write_index(1, DocIndex, test_doc(RandomInt), Ctx) end),
+        list_dir_sha(Index),
         timer:sleep(2000),
         NewRandState
       end,
@@ -210,6 +214,25 @@ write_without_commit(_Kind, Ctx) ->
     lists:seq(1, erpc:reqids_size(RunningReqIds))),
   ok.
 
+
+read_only(Kind, Ctx) ->
+  Index = get_index(1, Ctx),
+  Seq = lists:duplicate(5, search),
+  Runners = 1,
+  DoWork = fun () -> lists:foreach(fun (Action) -> case Action of
+          search -> spawn(fun() -> clouseau_rpc:search(Index#index.pid, [{limit, 100}]) end)
+        end,
+        timer:sleep(500)
+      end, Seq) end,
+  RunningReqIds = lists:foldl(
+    fun (N, ReqIds) -> erpc:send_request(node(), DoWork, N, ReqIds) end,
+    erpc:reqids_new(),
+    lists:seq(1, Runners)),
+  lists:foldl(
+    fun (_, ReqIds) -> {{response, _}, _, NewReqIds} = erpc:wait_response(ReqIds, 60000, true), NewReqIds end,
+    RunningReqIds,
+    lists:seq(1, erpc:reqids_size(RunningReqIds))),
+  ok.
 
 write_then_commit(_Kind, Ctx) ->
   Index = get_index(1, Ctx),
@@ -231,6 +254,61 @@ write_then_commit(_Kind, Ctx) ->
     lists:seq(1, Runners)),
   lists:foldl(
     fun (_, ReqIds) -> {{response, _}, _, NewReqIds} = erpc:wait_response(ReqIds, 60000, true), NewReqIds end,
+    RunningReqIds,
+    lists:seq(1, erpc:reqids_size(RunningReqIds))),
+  ok.
+
+
+%% Results:
+%% Seq = lists:duplicate(5, write) ++ [commit] ++ lists:duplicate(2, write) ++ [nuke_db, commit] ++ lists:duplicate(5, search),
+%% ls -l target/indexes/shards/00000000-ffffffff/eunit-test-db-ptunccxudh.1730151232/af9169515abe49ce02933b70385da7e5
+%%   total 16
+%%   -rw-r--r--@ 1 arturpoor  staff  215 Sep 30 15:03 segments_2
+%%   -rw-r--r--@ 1 arturpoor  staff   20 Sep 30 15:03 segments.gen
+%% ######
+%% Exception during write can kill indexer with FileNotFoundException
+%% lnav /Users/arturpoor/repo/clouseau/scripts/../tmp/zeunit.2026-09-30T12:40:39Z.log
+%
+% Promising: /Users/arturpoor/repo/clouseau/scripts/../tmp/zeunit.2026-10-02T12:21:49Z.log
+% with Seq = lists:duplicate(5, write) ++ [commit] ++ [nuke_db] ++ lists:duplicate(2, write) ++ lists:duplicate(5, search),
+% but index folder becomes empty, which is valid, not corrupt
+write_then_nuke_db_then_write_read(_Kind, Ctx) ->
+  Index = get_index(1, Ctx),
+  Seq = lists:duplicate(5, write) ++ [commit] ++ lists:duplicate(2, write) ++ [nuke_db, commit] ++ lists:duplicate(5, search),
+  Runners = 1,
+  StartDocIndex = 16,
+  RandSeed = rand:seed_s(exsss, 4711),
+  spawn(fun () ->
+      list_dir_sha(Index),
+      timer:sleep(500)
+    end),
+  DoWork = fun () -> lists:foldl(fun ({CommitIndex, Action}, RandState) ->
+        NextRandState = case Action of
+          write ->
+            {RandomInt, NewRandState} = rand:uniform_s(1_000_000, RandState),
+            spawn(fun() -> write_index(1, CommitIndex, test_doc(RandomInt), Ctx) end),
+            NewRandState;
+          commit ->
+            spawn(fun () -> clouseau_rpc:commit(Index#index.pid, CommitIndex) end),
+            RandState;
+          nuke_db ->
+            clouseau_rpc:cleanup(Ctx#context.shard_name),
+            RandState;
+          search ->
+            spawn(fun() -> clouseau_rpc:search(Index#index.pid, [{limit, 100}]) end),
+            RandState
+        end,
+        timer:sleep(2000),
+        NextRandState
+      end,
+      RandSeed,
+      lists:enumerate(StartDocIndex, Seq)) end,
+  RunningReqIds = lists:foldl(
+    fun (N, ReqIds) -> erpc:send_request(node(), DoWork, N, ReqIds) end,
+    erpc:reqids_new(),
+    lists:seq(1, Runners)),
+  lists:foldl(
+    fun (_, ReqIds) -> {{response, _}, _, NewReqIds} = erpc:wait_response(ReqIds, 120_000, true), NewReqIds end,
     RunningReqIds,
     lists:seq(1, erpc:reqids_size(RunningReqIds))),
   ok.
@@ -287,6 +365,119 @@ write_forcecleanup_search(_Kind, Ctx) ->
     RunningReqIds,
     lists:seq(1, erpc:reqids_size(RunningReqIds))),
   ok.
+
+% assert fails because new index is not opened
+multiple_index_services(_Kind, Ctx) ->
+  Index = get_index(1, Ctx),
+  Path = <<"../target/indexes/", (Index#index.path)/binary>>,
+  Seq = lists:duplicate(20, write) ++ [copy_index, write, write, wait, force_cleanup] ++ lists:duplicate(20, search),
+  Runners = 1,
+  StartDocIndex = 16,
+  RandSeed = rand:seed_s(exsss, 4711),
+  DoWork = fun () -> lists:foldl(fun ({ActionIndex, Action}, {RandState, ActCtx}) ->
+        NewAcc = case Action of
+          write ->
+            {RandomInt, NewRandState} = rand:uniform_s(1_000_000, RandState),
+            spawn(fun() -> write_index(1, ActionIndex, test_doc(RandomInt), ActCtx), clouseau_rpc:commit(Index#index.pid, ActionIndex) end),
+            timer:sleep(2000),
+            {NewRandState, ActCtx};
+          copy_index ->
+            {NewIndex, NewCtx} = copy_index(1, 2, Ctx),
+            ?assertNotEqual(NewIndex#index.pid, Index#index.pid, "Index pids should be different"),
+            {RandState, NewCtx};
+          wait ->
+            io:format("Waiting for commit~n"),
+            timer:sleep(5000),
+            {RandState, ActCtx};
+          force_cleanup ->
+            io:format("Cleaning up index folder ~s~n", [filename:absname(Path)]),
+            lists:foreach(fun (F) -> ok = file:delete(list_to_binary([Path, "/", F])) end, element(2, file:list_dir(Path))),
+            {RandState, ActCtx};
+          search ->
+            spawn(fun() -> clouseau_rpc:search(Index#index.pid, []) end),
+            {RandState, ActCtx}
+        end,
+        case file:list_dir(Path) of
+          {ok, Files} ->
+            FullPaths = lists:map(fun (File) -> binary_to_list(Path) ++ "/" ++ File end, Files),
+            Shas = os:cmd("sha256 " ++ lists:concat(lists:join(" ", FullPaths))),
+            io:format("Contents of index folder: ~s~n", [Shas]);
+          _ ->
+            io:format("Index folder not found~n")
+        end,
+        NewAcc
+      end,
+      {RandSeed, Ctx},
+      lists:enumerate(StartDocIndex, Seq))
+    end,
+  RunningReqIds = lists:foldl(
+    fun (N, ReqIds) -> erpc:send_request(node(), DoWork, N, ReqIds) end,
+    erpc:reqids_new(),
+    lists:seq(1, Runners)),
+  lists:foldl(
+    fun (_, ReqIds) -> {{response, _}, _, NewReqIds} = erpc:wait_response(ReqIds, 60000, true), NewReqIds end,
+    RunningReqIds,
+    lists:seq(1, erpc:reqids_size(RunningReqIds))),
+  ok.
+
+
+remove_read_end_during_writing(_Kind, Ctx) ->
+  Index = get_index(1, Ctx),
+  Path = <<"../target/indexes/", (Index#index.path)/binary>>,
+  Seq = lists:duplicate(20, write) ++ [force_cleanup_commits, write, write, write, wait] ++ lists:duplicate(20, search),
+  Runners = 1,
+  StartDocIndex = 16,
+  RandSeed = rand:seed_s(exsss, 4711),
+  DoWork = fun () -> lists:foldl(fun ({ActionIndex, Action}, {RandState, ActCtx}) ->
+        NewAcc = case Action of
+          write ->
+            {RandomInt, NewRandState} = rand:uniform_s(1_000_000, RandState),
+            spawn(fun() -> write_index(1, ActionIndex, test_doc(RandomInt), ActCtx), clouseau_rpc:commit(Index#index.pid, ActionIndex) end),
+            timer:sleep(2000),
+            {NewRandState, ActCtx};
+          wait ->
+            io:format("Waiting for commit~n"),
+            timer:sleep(5000),
+            {RandState, ActCtx};
+          force_cleanup_commits ->
+            io:format("Doing cleanup of past commit files~n"),
+            {ok, IndexFiles} = file:list_dir(Path),
+            CommitFilesFullPath = [ list_to_binary([Path, "/", F]) || F <- IndexFiles, lists:prefix("_0", F) ], %%lists:member(filename:extension(F), [".si", ".cfs", ".cfe"]) ],
+            io:format("Found these files to remove: ~p~nFull content list: ~p~n", [CommitFilesFullPath, IndexFiles]),
+            lists:foreach(fun file:delete/1, CommitFilesFullPath),
+            {RandState, ActCtx};
+          force_cleanup ->
+            io:format("Cleaning up index folder ~s~n", [filename:absname(Path)]),
+            lists:foreach(fun (F) -> ok = file:delete(list_to_binary([Path, "/", F])) end, element(2, file:list_dir(Path))),
+            {RandState, ActCtx};
+          search ->
+            io:format("Searching~n"),
+            spawn(fun() -> clouseau_rpc:search(Index#index.pid, []) end),
+            {RandState, ActCtx}
+        end,
+        case file:list_dir(Path) of
+          {ok, Files} ->
+            FullPaths = lists:map(fun (File) -> binary_to_list(Path) ++ "/" ++ File end, Files),
+            Shas = os:cmd("sha256 " ++ lists:concat(lists:join(" ", FullPaths))),
+            io:format("Contents of index folder: ~s~n", [Shas]);
+          _ ->
+            io:format("Index folder not found~n")
+        end,
+        NewAcc
+      end,
+      {RandSeed, Ctx},
+      lists:enumerate(StartDocIndex, Seq))
+    end,
+  RunningReqIds = lists:foldl(
+    fun (N, ReqIds) -> erpc:send_request(node(), DoWork, N, ReqIds) end,
+    erpc:reqids_new(),
+    lists:seq(1, Runners)),
+  lists:foldl(
+    fun (_, ReqIds) -> {{response, _}, _, NewReqIds} = erpc:wait_response(ReqIds, 60000, true), NewReqIds end,
+    RunningReqIds,
+    lists:seq(1, erpc:reqids_size(RunningReqIds))),
+  ok.
+
 
 t_cleanup_db(
     _Kind, #context{echo_pid = EchoService, dbname = DBName, shard_name = ShardsDbName} = Ctx
@@ -522,7 +713,7 @@ t_rename(_, #context{echo_pid = EchoService, dbname = DBName, shard_name = Shard
 %%%%%%%%%%%%%%% Utility Functions %%%%%%%%%%%%%%%
 setupDb(Kind) ->
     ?assert(test_util:wait_healthy(), "Init service is not ready"),
-    DbName = test_util:tempdb(),
+    DbName = <<"eunit-test-db-ptunccxudh">>, %%test_util:tempdb(),
     ShardsDbName = <<"shards/00000000-ffffffff/", DbName/binary, ".1730151232">>,
     configure(Kind),
     #context{
@@ -533,7 +724,7 @@ setupDb(Kind) ->
 setup({Kind, Name}) ->
     Ctx0 = setupDb(Kind),
     Ctx1 = open_indexes(Ctx0),
-    lists:foreach(fun (N) -> update_index(1, N, N, ?FIELDS, Ctx1), timer:sleep(1000) end, lists:seq(1, 15)),
+    %lists:foreach(fun (N) -> update_index(1, N, N, ?FIELDS, Ctx1), timer:sleep(1000) end, lists:seq(1, 15)),
     % ok = update_index(2, 2, ?FIELDS, Ctx1),
     EchoPid = start_service(Name),
     Ctx1#context{echo_pid = EchoPid}.
@@ -546,8 +737,15 @@ open_indexes(#context{shard_name = ShardsDbName} = Ctx) ->
         }
     }.
 
+copy_index(Idx, NewIdx, Ctx) ->
+  Index = get_index(Idx, Ctx),
+  {ok, IndexPid} = clouseau_rpc:open_index(self(), Index#index.path, ?Analyzer),
+  ?assert(is_pid(IndexPid)),
+  NewIndex = Index#index{idx = NewIdx, pid = IndexPid},
+  {NewIndex, Ctx#context{indexes = (Ctx#context.indexes)#{NewIdx => NewIndex}}}.
+
 open_index(Idx, ShardsDbName) ->
-    Sig = mock_sig({Idx, ShardsDbName}),
+    Sig = fix_sig(), %mock_sig({Idx, ShardsDbName}),
     Path = <<ShardsDbName/binary, "/", Sig/binary>>,
     Self = self(),
     ReqId = make_ref(),
@@ -609,6 +807,8 @@ cleanup_index(Idx, #context{dbname = DbName, indexes = Indexes} = Ctx) ->
 get_index(Idx, #context{indexes = Indexes}) ->
     #{Idx := #index{} = Index} = Indexes,
     Index.
+
+fix_sig() -> <<"af9169515abe49ce02933b70385da7e5">>.
 
 mock_sig(Term) ->
     binary:encode_hex(erlang:md5(term_to_binary(Term)), lowercase).

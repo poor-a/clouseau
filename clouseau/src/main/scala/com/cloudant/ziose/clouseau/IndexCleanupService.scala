@@ -75,7 +75,7 @@ class IndexCleanupService(ctx: ServiceContext[ConfigurationArgs])(implicit adapt
       }
     }
   }
-
+  // throw exception / log if fileOrDir doesn't exists
   private def recursivelyDelete(fileOrDir: File, deleteDir: Boolean): Unit = {
     if (fileOrDir.isDirectory) {
       // Wrap file list in `Option` to handle `null` case

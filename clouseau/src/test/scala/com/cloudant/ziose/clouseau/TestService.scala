@@ -3,13 +3,15 @@ package com.cloudant.ziose.clouseau
 import com.cloudant.ziose.macros.CheckEnv
 import com.cloudant.ziose.{core, scalang}
 import core.ActorBuilder.State
-import core.{ActorBuilder, ActorConstructor, Codec, ProcessContext}
+import core.{ActorBuilder, ActorConstructor, Address, Codec, ForwardWithId, MessageEnvelope, ProcessContext}
 import scalang.{Adapter, Pid, SNode, Service, ServiceContext}
 
 import java.time.Instant
 import java.time.temporal.ChronoUnit
 import zio._
+
 import java.util.concurrent.TimeoutException
+import scala.collection.mutable
 
 case class TestServiceArgs(terminate: Queue[Unit])
 
@@ -170,4 +172,16 @@ private object TestService extends ActorConstructor[TestService] {
     } yield TestServiceHandle(actor.asInstanceOf[core.AddressableActor[TestService, _]], terminateChannel)
   }
 
+}
+
+class MessageCollector(addr: Address) extends ForwardWithId[Address, MessageEnvelope] {
+  val capturedMessages: mutable.Buffer[MessageEnvelope] = mutable.ListBuffer()
+  override val id: Address                              = addr
+
+  override def forward(a: MessageEnvelope)(implicit trace: Trace): UIO[Boolean] = {
+    capturedMessages.append(a)
+    ZIO.succeed(true)
+  }
+
+  override def shutdown(implicit trace: Trace): UIO[Unit] = ZIO.succeed(())
 }

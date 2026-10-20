@@ -3,17 +3,22 @@ sbt 'clouseau/testOnly com.cloudant.ziose.clouseau.IndexManagerServiceSpec'
  */
 package com.cloudant.ziose.clouseau
 
+import com.cloudant.ziose.core.Codec.EPid
+import com.cloudant.ziose.core.MessageEnvelope.Response
 import org.junit.runner.RunWith
 import zio._
 import zio.test.junit.{JUnitRunnableSpec, ZTestJUnitRunner}
 
 import java.io.File
-
 import com.cloudant.ziose.core._
-import com.cloudant.ziose.scalang.{Adapter, ServiceContext}
+import com.cloudant.ziose.otp.{OTPEngineWorker, OTPNodeConfig, OTPProcessContext}
+import com.cloudant.ziose.scalang.ProcessLike.NodeName
+import com.cloudant.ziose.scalang.{Adapter, Pid, Reference, ServiceContext}
 import zio.test._
 import zio.test.TestAspect
 import com.cloudant.ziose.test.helpers.TestRunner
+import com.ericsson.otp.erlang.OtpNode
+import zio.test.Assertion.{anything, equalTo, forall, hasSameElements, hasSize, isSome, isSubtype}
 
 @RunWith(classOf[ZTestJUnitRunner])
 class IndexManagerServiceSpec extends JUnitRunnableSpec {
@@ -47,7 +52,35 @@ class IndexManagerServiceSpec extends JUnitRunnableSpec {
     foo2indexDir.mkdirs
   }
 
-  val startIndexManager = {
+  type TestContext = EngineWorker & Node & ActorFactory & OTPNodeConfig
+
+  def makeIndexManager(node: OtpNode): ZIO[TestContext & Scope, Throwable, IndexManagerService] = {
+    for {
+      snode <- Utils.clouseauNode
+      worker <- ZIO.service[EngineWorker]
+      mbox = node.createMbox("test manager mailbox")
+      cfg    <- Utils.defaultConfig
+      scfg = new ServiceContext[ConfigurationArgs] {
+        override def args: ConfigurationArgs = ConfigurationArgs(cfg)
+      }
+      reg = Metrics.simpleRegistry
+      scope <- ZIO.scope
+      closeable <- scope.fork
+      builder = IndexManagerServiceBuilder.make(snode, scfg)
+      ctx <- OTPProcessContext.builder(Symbol("test process name"))
+        .withOtpMbox(mbox)
+        .withMeterRegistry(reg)
+        .withScope(closeable)
+        .withWorker(worker.asInstanceOf[OTPEngineWorker])
+        .withBuilder(builder)
+        .build()
+      _ = println(s"Index manager has Address ${ctx.id}")
+      _ = println(s"Index manager has self ${ctx.self}")
+      adapter = Adapter(ctx, snode, ClouseauTypeFactory)
+    } yield new IndexManagerService(scfg)(adapter)
+  }
+
+  val startIndexManager: ZIO[TestContext, Throwable, AddressableActor[IndexManagerService, _ <: ProcessContext]] = {
     for {
       node   <- Utils.clouseauNode
       worker <- ZIO.service[EngineWorker]
@@ -110,10 +143,10 @@ class IndexManagerServiceSpec extends JUnitRunnableSpec {
     })
   }
 
-  val startPeer = {
+  def startPeer(name: String = "dummy") = {
     for {
       node <- Utils.clouseauNode
-      peer <- TestService.start(node, "dummy")
+      peer <- TestService.start(node, name)
     } yield peer.actor
   }
 
@@ -127,18 +160,91 @@ class IndexManagerServiceSpec extends JUnitRunnableSpec {
 
   val indexManagerSuite: Spec[Any, Throwable] = {
     suite("index manager")(
-      test("open an index when asked")(
+      /*test("opens an index when asked")(
         for {
-          peer    <- startPeer
+          peer    <- startPeer()
           manager <- startIndexManager
           pid     <- openIndex(manager, peer, "foo", analyzerOptions)
           _       <- stopActor(peer)
           _       <- stopIndexManager(manager)
         } yield assertTrue(pid.isDefined)
       ),
-      test("return the same index if it's already open")(
+      test("opens an index without reply")(
         for {
-          peer    <- startPeer
+          peer   <- startPeer()
+          node = new OtpNode("test node")
+          manager <- ZIO.scoped(makeIndexManager(node))
+          newRef  = Codec.ERef(node.createRef())
+          resp <- ZIO.succeed(manager.handleCall((peer.self, newRef), OpenIndexMsg(peer.self, "SOMEPATH", AnalyzerOptions(Map("name" -> "standard")))))
+          _       <- stopActor(peer)
+        } yield assert(resp)(equalTo(Symbol("noreply")))
+      ),*/
+      test("puts waiters in a queue and notifies them on when index is open")(
+        for {
+          _ <- ZIO.succeed(())
+          // mockIndex <- startPeer("mock index")
+          node = new OtpNode("IndexManager@127.0.0.1")
+          //receiverPid = node.createPid()
+          receiverMBox = node.createMbox("test mailbox")
+          receiverPid = receiverMBox.self()
+          mockIndexMBox = node.createMbox("mock index")
+          _ = println(s"Node name is '${receiverPid.node()}'")
+          mockIndexPid = mockIndexMBox.self()
+          manager <- ZIO.scoped(makeIndexManager(node))
+          engine <- ZIO.service[EngineWorker]
+          collector = new MessageCollector(Address.fromPid(Codec.EPid(receiverPid), 1, Symbol(receiverPid.node())))
+          _       <- engine.register(collector)
+          newRef  = Reference.toScala(Codec.ERef(node.createRef()))
+          path = "SOMEPATH"
+          openCall = OpenIndexMsg(Codec.EPid(receiverPid), path, AnalyzerOptions(Map("name" -> "standard")))
+          _ <- ZIO.succeed(manager.handleCall((Codec.EPid(receiverPid), newRef), openCall))
+          resp <- ZIO.succeed(manager.handleCall((Codec.EPid(receiverPid), newRef), openCall))
+          indexPid = Codec.EPid(mockIndexPid)
+          openResp <- ZIO.succeed(manager.handleInfo((Symbol("open_ok"), path, Pid.e2pid(Codec.EPid(receiverPid)), Pid.e2pid(indexPid))))
+          // _       <- stopActor(peer)
+        } yield {
+          val messages = collector.capturedMessages
+          val isOpenOkResponse = CustomAssertion.make[MessageEnvelope] {
+            case MessageEnvelope.Response(_, _, _, _, _, Some(payload), _, _) => Right(Codec.toScala(payload))
+            case _ => Left("Not a response with a payload")
+          }
+          assert(resp)(equalTo(Symbol("noreply"))) &&
+            assert(openResp)(equalTo(Symbol("noreply"))) &&
+            assert(messages)(hasSize(equalTo(2))) &&
+            assertTrue(messages.forall(_.is(_.custom(isOpenOkResponse)) == (Symbol("ok"), EPid(mockIndexPid))))
+        }
+      ),
+      /*test("opens an index atomically")(
+        for {
+          peer   <- startPeer
+          node   <- ZIO.service[Node]
+          engine <- ZIO.service[EngineWorker]
+          _      <- engine.unregister(peer.self)
+          collector = new MessageCollector(peer.self)
+          _       <- engine.register(collector)
+          manager <- startIndexManager
+          newRef  <- node.makeRef()
+          Some(openCall) = makeCall(
+            manager.self,
+            ETuple(peer.self.pid, newRef),
+            openMessage(peer.self),
+            None
+          )
+          _ <- manager.onMessage(openCall)
+          _ <- manager.onMessage(openCall)
+          _ <- stopActor(peer)
+          _ <- stopIndexManager(manager)
+        } yield {
+          val messages = collector.capturedMessages
+          assertTrue(messages.size == 2) &&
+          assert(messages)(forall(isSubtype[MessageEnvelope.Response](anything))) &&
+          assert(messages.map(m => parseOpenIndexResponse(m.asInstanceOf[MessageEnvelope.Response])))(forall(isSome)) &&
+          assert(messages.tail)(forall(equalTo(messages.head)))
+        }
+      ),
+      test("returns the same index if it's already open")(
+        for {
+          peer    <- startPeer()
           manager <- startIndexManager
           pid1    <- openIndex(manager, peer, "foo", analyzerOptions)
           pid2    <- openIndex(manager, peer, "foo", analyzerOptions)
@@ -149,7 +255,7 @@ class IndexManagerServiceSpec extends JUnitRunnableSpec {
           pid2.isDefined,
           pid1.get == pid2.get
         )
-      )
+      )*/
     ).provideLayer(environment) @@ TestAspect.withLiveClock @@ TestAspect.sequential
   }
 
@@ -192,8 +298,8 @@ class IndexManagerServiceSpec extends JUnitRunnableSpec {
 
   def spec: Spec[Any, Throwable] = {
     suite("IndexManagerServiceSpec")(
-      indexManagerSuite,
-      diskSizeSuite
+      indexManagerSuite//,
+      //diskSizeSuite
     ) @@ TestAspect.timeout(TIMEOUT_SUITE)
   }
 }

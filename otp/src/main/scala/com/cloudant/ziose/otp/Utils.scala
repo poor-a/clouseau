@@ -7,9 +7,10 @@ object Utils {
   def testEnvironment(
     engineId: Engine.EngineId,
     workerId: Engine.WorkerId,
-    nodeName: String = "test"
+    nodeName: String = "test",
+    domain: String = "127.0.0.1"
   ): TaskLayer[EngineWorker & Node & ActorFactory & OTPNodeConfig] = {
-    val nodeCfg = OTPNodeConfig(nodeName, "127.0.0.1", "testCookie", 1.second, 60.seconds)
+    val nodeCfg = OTPNodeConfig(nodeName, domain, "testCookie", 1.second, 60.seconds)
     OTPLayers.nodeLayers(engineId, workerId, nodeCfg) ++ ZLayer.succeed(nodeCfg)
   }
 }

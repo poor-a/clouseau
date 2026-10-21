@@ -160,7 +160,7 @@ class IndexManagerServiceSpec extends JUnitRunnableSpec {
 
   val indexManagerSuite: Spec[Any, Throwable] = {
     suite("index manager")(
-      /*test("opens an index when asked")(
+      test("opens an index when asked")(
         for {
           peer    <- startPeer()
           manager <- startIndexManager
@@ -173,13 +173,19 @@ class IndexManagerServiceSpec extends JUnitRunnableSpec {
         for {
           peer   <- startPeer()
           node = new OtpNode("test node")
+          receiverMBox = node.createMbox("test mailbox")
+          receiverPid = receiverMBox.self()
           manager <- ZIO.scoped(makeIndexManager(node))
-          newRef  = Codec.ERef(node.createRef())
+          engine <- ZIO.service[EngineWorker]
+          collector = new MessageCollector(Address.fromPid(Codec.EPid(receiverPid), 1, Symbol(receiverPid.node())))
+          _       <- engine.register(collector)
+          newRef  = Reference.toScala(Codec.ERef(node.createRef()))
           resp <- ZIO.succeed(manager.handleCall((peer.self, newRef), OpenIndexMsg(peer.self, "SOMEPATH", AnalyzerOptions(Map("name" -> "standard")))))
           _       <- stopActor(peer)
-        } yield assert(resp)(equalTo(Symbol("noreply")))
-      ),*/
-      test("puts waiters in a queue and notifies them on when index is open")(
+        } yield assert(resp)(equalTo(Symbol("noreply"))) &&
+            assert(collector.capturedMessages)(hasSize(equalTo(0)))
+      ),
+      test("puts waiters in a queue and notifies them when index is open")(
         for {
           _ <- ZIO.succeed(())
           // mockIndex <- startPeer("mock index")
@@ -214,32 +220,112 @@ class IndexManagerServiceSpec extends JUnitRunnableSpec {
             assertTrue(messages.forall(_.is(_.custom(isOpenOkResponse)) == (Symbol("ok"), EPid(mockIndexPid))))
         }
       ),
-      /*test("opens an index atomically")(
+      test("reports 'opening when asked to delete an index being initialized")(
         for {
-          peer   <- startPeer
-          node   <- ZIO.service[Node]
+          _ <- ZIO.succeed(())
+          // mockIndex <- startPeer("mock index")
+          node = new OtpNode("IndexManager@127.0.0.1")
+          //receiverPid = node.createPid()
+          receiverMBox = node.createMbox("test mailbox")
+          receiverPid = receiverMBox.self()
+          mockIndexMBox = node.createMbox("mock index")
+          _ = println(s"Node name is '${receiverPid.node()}'")
+          mockIndexPid = mockIndexMBox.self()
+          manager <- ZIO.scoped(makeIndexManager(node))
           engine <- ZIO.service[EngineWorker]
-          _      <- engine.unregister(peer.self)
-          collector = new MessageCollector(peer.self)
+          collector = new MessageCollector(Address.fromPid(Codec.EPid(receiverPid), 1, Symbol(receiverPid.node())))
           _       <- engine.register(collector)
-          manager <- startIndexManager
-          newRef  <- node.makeRef()
-          Some(openCall) = makeCall(
-            manager.self,
-            ETuple(peer.self.pid, newRef),
-            openMessage(peer.self),
-            None
-          )
-          _ <- manager.onMessage(openCall)
-          _ <- manager.onMessage(openCall)
-          _ <- stopActor(peer)
-          _ <- stopIndexManager(manager)
+          newRef  = Reference.toScala(Codec.ERef(node.createRef()))
+          path = "SOMEPATH"
+          openCall = OpenIndexMsg(Codec.EPid(receiverPid), path, AnalyzerOptions(Map("name" -> "standard")))
+          _ <- ZIO.succeed(manager.handleCall((Codec.EPid(receiverPid), newRef), openCall))
+          deleteCall = DeleteDocMsg(path)
+          indexPid = Codec.EPid(mockIndexPid)
+          deleteResp <- ZIO.succeed(manager.handleCall((Codec.EPid(receiverPid), newRef), deleteCall))
+          // _       <- stopActor(peer)
         } yield {
           val messages = collector.capturedMessages
-          assertTrue(messages.size == 2) &&
-          assert(messages)(forall(isSubtype[MessageEnvelope.Response](anything))) &&
-          assert(messages.map(m => parseOpenIndexResponse(m.asInstanceOf[MessageEnvelope.Response])))(forall(isSome)) &&
-          assert(messages.tail)(forall(equalTo(messages.head)))
+          assert(deleteResp)(equalTo(Symbol("opening"))) &&
+            assert(messages)(hasSize(equalTo(0)))
+        }
+      ),
+      test("reports 'ok when asked to delete an index fully initialized")(
+        for {
+          _ <- ZIO.succeed(())
+          // mockIndex <- startPeer("mock index")
+          node = new OtpNode("IndexManager@127.0.0.1")
+          //receiverPid = node.createPid()
+          receiverMBox = node.createMbox("test mailbox")
+          receiverPid = receiverMBox.self()
+          mockIndexMBox = node.createMbox("mock index")
+          _ = println(s"Node name is '${receiverPid.node()}'")
+          mockIndexPid = mockIndexMBox.self()
+          manager <- ZIO.scoped(makeIndexManager(node))
+          engine <- ZIO.service[EngineWorker]
+          collector = new MessageCollector(Address.fromPid(Codec.EPid(receiverPid), 1, Symbol(receiverPid.node())))
+          _       <- engine.register(collector)
+          newRef  = Reference.toScala(Codec.ERef(node.createRef()))
+          path = "SOMEPATH"
+          openCall = OpenIndexMsg(Codec.EPid(receiverPid), path, AnalyzerOptions(Map("name" -> "standard")))
+          _ <- ZIO.succeed(manager.handleCall((Codec.EPid(receiverPid), newRef), openCall))
+          indexPid = Codec.EPid(mockIndexPid)
+          openResp <- ZIO.succeed(manager.handleInfo((Symbol("open_ok"), path, Pid.e2pid(Codec.EPid(receiverPid)), Pid.e2pid(indexPid))))
+          deleteCall = DeleteDocMsg(path)
+          deleteResp <- ZIO.succeed(manager.handleCall((Codec.EPid(receiverPid), newRef), deleteCall))
+          // _       <- stopActor(peer)
+        } yield {
+          val isOpenOkResponse = CustomAssertion.make[MessageEnvelope] {
+            case MessageEnvelope.Response(_, _, _, _, _, Some(payload), _, _) => Right(Codec.toScala(payload))
+            case _ => Left("Not a response with a payload")
+          }
+          val messages = collector.capturedMessages
+          assert(deleteResp)(equalTo(Symbol("ok"))) &&
+            assert(messages)(hasSize(equalTo(1))) &&
+            assertTrue(messages.forall(_.is(_.custom(isOpenOkResponse)) == (Symbol("ok"), EPid(mockIndexPid))))
+        }
+      ),
+      test("sends 'delete to fully initialized index when asked to delete")(
+        for {
+          _ <- ZIO.succeed(())
+          // mockIndex <- startPeer("mock index")
+          node = new OtpNode("IndexManager@127.0.0.1")
+          //receiverPid = node.createPid()
+          receiverMBox = node.createMbox("test mailbox")
+          receiverPid = receiverMBox.self()
+          mockIndexMBox = node.createMbox("mock index")
+          _ = println(s"Node name is '${receiverPid.node()}'")
+          mockIndexPid = mockIndexMBox.self()
+          manager <- ZIO.scoped(makeIndexManager(node))
+          engine <- ZIO.service[EngineWorker]
+          collector = new MessageCollector(Address.fromPid(Codec.EPid(receiverPid), 1, Symbol(receiverPid.node())))
+          mockIndexCollector = new MessageCollector(Address.fromPid(Codec.EPid(mockIndexPid), 1, Symbol(mockIndexPid.node())))
+          _       <- engine.register(collector)
+          _       <- engine.register(mockIndexCollector)
+          newRef  = Reference.toScala(Codec.ERef(node.createRef()))
+          path = "SOMEPATH"
+          openCall = OpenIndexMsg(Codec.EPid(receiverPid), path, AnalyzerOptions(Map("name" -> "standard")))
+          _ <- ZIO.succeed(manager.handleCall((Codec.EPid(receiverPid), newRef), openCall))
+          indexPid = Codec.EPid(mockIndexPid)
+          openResp <- ZIO.succeed(manager.handleInfo((Symbol("open_ok"), path, Pid.e2pid(Codec.EPid(receiverPid)), Pid.e2pid(indexPid))))
+          deleteCall = DeleteDocMsg(path)
+          deleteResp <- ZIO.succeed(manager.handleCall((Codec.EPid(receiverPid), newRef), deleteCall))
+          // _       <- stopActor(peer)
+        } yield {
+          val isOpenOkResponse = CustomAssertion.make[MessageEnvelope] {
+            case MessageEnvelope.Response(_, _, _, _, _, Some(payload), _, _) => Right(Codec.toScala(payload))
+            case _ => Left("Not a response with payload")
+          }
+          val isSendMessage = CustomAssertion.make[MessageEnvelope] {
+            case MessageEnvelope.Send(_, _, payload, _) => Right(Codec.toScala(payload))
+            case _ => Left("Not a send")
+          }
+          val messages = collector.capturedMessages
+          val indexMessages = mockIndexCollector.capturedMessages
+          assert(deleteResp)(equalTo(Symbol("ok"))) &&
+            assert(messages)(hasSize(equalTo(1))) &&
+            assertTrue(messages.forall(_.is(_.custom(isOpenOkResponse)) == (Symbol("ok"), EPid(mockIndexPid)))) &&
+            assert(indexMessages)(hasSize(equalTo(1))) &&
+            assertTrue(indexMessages.forall(_.is(_.custom(isSendMessage)) == Symbol("delete")))
         }
       ),
       test("returns the same index if it's already open")(
@@ -255,7 +341,7 @@ class IndexManagerServiceSpec extends JUnitRunnableSpec {
           pid2.isDefined,
           pid1.get == pid2.get
         )
-      )*/
+      )
     ).provideLayer(environment) @@ TestAspect.withLiveClock @@ TestAspect.sequential
   }
 

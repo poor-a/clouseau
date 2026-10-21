@@ -195,10 +195,12 @@ class IndexManagerService(ctx: ServiceContext[ConfigurationArgs])(implicit adapt
     case ('get_root_dir) =>
       ('ok, rootDir.getAbsolutePath())
     case DeleteDocMsg(path: String) =>
-      lru.get(path) match {
-        case null =>
+      (lru.get(path), waiters.get(path)) match {
+        case (null, None) =>
           ('error, 'not_found)
-        case pid: Pid =>
+        case (null, Some(_)) =>
+          'opening
+        case (pid: Pid, _) =>
           pid ! 'delete
           'ok
       }
@@ -273,10 +275,12 @@ class IndexManagerService(ctx: ServiceContext[ConfigurationArgs])(implicit adapt
   private def replyAll(path: String, msg: Any) = {
     waiters.remove(path) match {
       case Some(list) =>
+        println(s"Replying to callers $list")
         for (tag <- list) {
           Service.reply(tag, msg)
         }
       case None =>
+        println("No callers to reply to")
         'ok
     }
   }
